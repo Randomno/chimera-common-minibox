@@ -18,6 +18,7 @@ uintptr_t mb_host_proc_addr(mb_host *h, const char *name);
 uintptr_t mb_host_proc_addr_raw(mb_host *h, const char *name);
 uintptr_t mb_host_callin_addr(mb_host *h, uintptr_t ptr);
 int       mb_host_callback_addr(mb_host *h, mb_external_callback cb, uintptr_t slot, uintptr_t *out);
+void      mb_host_advance_clock(mb_host *h, uint64_t delta_ns);
 int       mb_host_seal(mb_host *h, char *errbuf, size_t errlen);
 int       mb_host_mount(mb_host *h, const char *name, const uint8_t *data, size_t len, bool writable);
 int       mb_host_mount_path(mb_host *h, const char *name, const char *path);
@@ -133,6 +134,16 @@ void wbx_unmount_file(mb_host *obj, const char *name, mb_write_callback cb, uint
 void wbx_save_state(mb_host *obj, mb_write_callback cb, uintptr_t userdata, mb_return *ret) {
 	char e[256]; e[0] = 0;
 	if (mb_host_save_state(obj, cb, userdata, e, sizeof(e)) != 0) { err(ret, e); return; }
+	ok(ret, 0);
+}
+
+/* Frame-paced virtual time (see mb_threads_advance): a frame-driven core
+ * advances the guest logical clock once per pumped frame so guests that
+ * read time per frame (heartbeats, stream clocks) observe frame time.
+ * Deterministic for fixed per-frame deltas. */
+void wbx_advance_clock(mb_host *obj, uint64_t delta_ns, mb_return *ret) {
+	if (!obj) { err(ret, "no host"); return; }
+	mb_host_advance_clock(obj, delta_ns);
 	ok(ret, 0);
 }
 

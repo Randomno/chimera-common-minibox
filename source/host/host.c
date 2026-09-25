@@ -51,6 +51,7 @@ enum {
 	NR_clock_gettime=228, NR_set_tid_address=218, NR_getrandom=318, NR_fcntl=72,
 	NR_fsync=74, NR_fdatasync=75, NR_sync=162, NR_syncfs=306,
 	NR_getuid=102, NR_getgid=104, NR_geteuid=107, NR_getegid=108, NR_wbx_clone=2000,
+	NR_getrusage=98,
 	NR_tkill=200, NR_exit_group=231, NR_tgkill=234,
 	NR_readlink=89, NR_readlinkat=267, NR_pipe=22, NR_pipe2=293,
 };
@@ -447,6 +448,12 @@ static uintptr_t MB_SYSV dispatch_inner(uintptr_t a1, uintptr_t a2, uintptr_t a3
 			si[4] = 1024ull << 20;        /* totalram */
 			si[5] = 512ull << 20;         /* freeram */
 			((uint32_t *)a1)[100 / 4] = 1; /* mem_unit at offset 100 */
+			return sok(0);
+		}
+		case NR_getrusage: {
+			/* zeros: no resource usage is observable in-guest.
+			 * (a1 is who=RUSAGE_SELF/CHILDREN, a2 is struct rusage*.) */
+			memset((void *)a2, 0, 144);
 			return sok(0);
 		}
 		case NR_prctl:
@@ -871,6 +878,12 @@ void mb_host_deactivate(mb_host *h) {
 	h->context.host_ptr = 0;
 	mb_block_deactivate(h->block);
 	h->active = false;
+}
+
+/* Frame-paced virtual time (see mb_threads_advance): advance the guest
+ * logical clock by delta_ns and expire due deadlines. */
+void mb_host_advance_clock(mb_host *h, uint64_t delta_ns) {
+	if (h && h->threads) mb_threads_advance(h->threads, delta_ns);
 }
 
 uintptr_t mb_host_proc_addr(mb_host *h, const char *name) {

@@ -198,6 +198,16 @@ void mb_threads_tick(mb_threads *t) {
 	t->clock_ns += (uint64_t)tick_ns;
 	expire_due(t);
 }
+/* frame-paced virtual time: advance the logical clock by a whole frame
+ * and expire due deadlines. Observation-counted ticks (1us/read) freeze
+ * guests that read time once per frame (e.g. a 41ms heartbeat accumulates
+ * microseconds); a frame-driven core advances the clock per pumped frame
+ * instead. Deterministic (call-counted, fixed delta). */
+void mb_threads_advance(mb_threads *t, uint64_t delta_ns) {
+	if (!t) return;
+	t->clock_ns += delta_ns;
+	expire_due(t);
+}
 void mb_threads_free(mb_threads *t) {
 	if (!t) return;
 	for (size_t i = 0; i < t->nfut; i++) { free(t->futicies[i].tids); free(t->futicies[i].deadline); }

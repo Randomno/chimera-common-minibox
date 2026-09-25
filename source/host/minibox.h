@@ -67,6 +67,7 @@ void wbx_mount_file_path(mb_host *obj, const char *name, const char *host_path, 
 void wbx_unmount_file(mb_host *obj, const char *name, mb_write_callback cb, uintptr_t userdata, mb_return *ret);
 void wbx_save_state(mb_host *obj, mb_write_callback cb, uintptr_t userdata, mb_return *ret);
 void wbx_load_state(mb_host *obj, mb_read_callback cb, uintptr_t userdata, mb_return *ret);
+void wbx_advance_clock(mb_host *obj, uint64_t delta_ns, mb_return *ret);
 
 /* ---- epochs and deltas ----
  *

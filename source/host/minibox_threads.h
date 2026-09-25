@@ -23,6 +23,7 @@ uintptr_t mb_threads_futex_wait(mb_threads *t, mb_context *c, uintptr_t addr, ui
  * timed-wait expiry and nanosleep. Guest-deterministic (deadline-driven). */
 uint64_t      mb_threads_clock_get(mb_threads *t);
 void          mb_threads_clock_advance(mb_threads *t, uint64_t delta_ns);
+void          mb_threads_advance(mb_threads *t, uint64_t delta_ns);
 uint32_t      mb_threads_active_tid(mb_threads *t);
 void          mb_threads_tick(mb_threads *t);
 mb_sword      mb_threads_futex_wake(mb_threads *t, mb_context *c, uintptr_t addr, uint32_t count);
