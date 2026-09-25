@@ -411,15 +411,26 @@ uintptr_t mb_threads_yield(mb_threads *t, mb_context *c) { return swap_to_next(t
 static int wr(mb_write_cb w, uintptr_t ud, const void *d, size_t n) { return w(ud, d, n) < 0 ? -1 : 0; }
 static int rd(mb_read_cb r, uintptr_t ud, void *d, size_t n) { uint8_t *p = d; while (n) { intptr_t g = r(ud, p, n); if (g <= 0) return -1; p += g; n -= (size_t)g; } return 0; }
 
+/* Thread-section encoding v2 ("GuestThreadSe2"): v1 ("GuestThreadSet") saved
+ * thread registers and waiter tids but NOT the logical clock or waiter
+ * deadlines (both guest-observable: clock_gettime, futex/nanosleep timeouts).
+ * A load therefore resumed with the LOADER's clock and immortal waiters, so a
+ * mid-game state idled ~15 virtual seconds on backup timers before the tick
+ * resumed - and how long depended on when you loaded, i.e. rewind timing
+ * varied load to load. v2 stores clock_ns plus each waiter's absolute
+ * deadline (0 = infinite, preserved), restoring the exact wakeup schedule.
+ * The loader still reads v1 (waiters restored due, see below). */
+#define THREADS_MAGIC_V2 "GuestThreadSe2"
 int mb_threads_save(mb_threads *t, mb_context *c, mb_write_cb w, uintptr_t ud) {
 	if (t->active_tid != 1) { fprintf(stderr, "miniBox: thread hijack on save\n"); return -1; }
 	gthread *main = find_thread(t, 1);
 	main->thread_area = c->thread_area; main->rsp = c->guest_rsp;
-	if (wr(w, ud, "GuestThreadSet", 14)) return -1;
+	if (wr(w, ud, THREADS_MAGIC_V2, 14)) return -1;
 	if (wr(w, ud, &t->next_tid, 4) || wr(w, ud, &t->active_tid, 4)) return -1;
 	uint32_t nt = (uint32_t)t->nthreads;
 	if (wr(w, ud, &nt, 4)) return -1;
 	for (size_t i = 0; i < t->nthreads; i++) if (wr(w, ud, &t->threads[i], sizeof(gthread))) return -1;
+	if (wr(w, ud, &t->clock_ns, 8)) return -1;
 	uint32_t nf = (uint32_t)t->nfut;
 	if (wr(w, ud, &nf, 4)) return -1;
 	for (size_t i = 0; i < t->nfut; i++) {
@@ -427,21 +438,25 @@ int mb_threads_save(mb_threads *t, mb_context *c, mb_write_cb w, uintptr_t ud) {
 		uint32_t qn = (uint32_t)t->futicies[i].n;
 		if (wr(w, ud, &qn, 4)) return -1;
 		if (qn && wr(w, ud, t->futicies[i].tids, qn * sizeof(uint32_t))) return -1;
+		if (qn && wr(w, ud, t->futicies[i].deadline, qn * sizeof(uint64_t))) return -1;
 	}
-	if (wr(w, ud, "GuestThreadSet", 14)) return -1;
+	if (wr(w, ud, THREADS_MAGIC_V2, 14)) return -1;
 	return 0;
 }
 
 int mb_threads_load(mb_threads *t, mb_context *c, mb_read_cb r, uintptr_t ud) {
 	if (t->active_tid != 1) { fprintf(stderr, "miniBox: thread hijack on load\n"); return -1; }
 	char magic[14];
-	if (rd(r, ud, magic, 14) || memcmp(magic, "GuestThreadSet", 14) != 0) return -1;
+	if (rd(r, ud, magic, 14)) return -1;
+	int v2 = memcmp(magic, THREADS_MAGIC_V2, 14) == 0;
+	if (!v2 && memcmp(magic, "GuestThreadSet", 14) != 0) return -1;
 	if (rd(r, ud, &t->next_tid, 4) || rd(r, ud, &t->active_tid, 4)) return -1;
 	uint32_t nt;
 	if (rd(r, ud, &nt, 4)) return -1;
 	t->nthreads = 0;
 	for (uint32_t i = 0; i < nt; i++) { gthread g; if (rd(r, ud, &g, sizeof(gthread))) return -1; insert_thread(t, g); }
-	for (size_t i = 0; i < t->nfut; i++) free(t->futicies[i].tids);
+	if (v2) { uint64_t clk; if (rd(r, ud, &clk, 8)) return -1; t->clock_ns = clk; }
+	for (size_t i = 0; i < t->nfut; i++) { free(t->futicies[i].tids); free(t->futicies[i].deadline); }
 	t->nfut = 0;
 	uint32_t nf;
 	if (rd(r, ud, &nf, 4)) return -1;
@@ -455,7 +470,9 @@ int mb_threads_load(mb_threads *t, mb_context *c, mb_read_cb r, uintptr_t ud) {
 		for (uint32_t j = 0; j < qn; j++) { uint32_t tid; if (rd(r, ud, &tid, 4)) return -1; queue_push(q, tid, 1); /* savestate predates deadlines: restore due (not infinite), so a waiter parked on a timed wait wakes with ETIMEDOUT on the next expiry pass and retries with a fresh deadline. An infinite waiter woken this way spuriously re-parks (callers re-check), exactly as native spurious wakeups. Leaving them infinite parks timer workers forever: the tick never resumes after a restore. */ }
 		}
 	}
-	if (rd(r, ud, magic, 14) || memcmp(magic, "GuestThreadSet", 14) != 0) return -1;
+	if (rd(r, ud, magic, 14)) return -1;
+	if (v2) { if (memcmp(magic, THREADS_MAGIC_V2, 14) != 0) return -1; }
+	else if (memcmp(magic, "GuestThreadSet", 14) != 0) return -1;
 	gthread *main = find_thread(t, 1);
 	c->thread_area = main->thread_area; c->guest_rsp = main->rsp;
 	return 0;
