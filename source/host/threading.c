@@ -449,7 +449,11 @@ int mb_threads_load(mb_threads *t, mb_context *c, mb_read_cb r, uintptr_t ud) {
 		uintptr_t addr; uint32_t qn;
 		if (rd(r, ud, &addr, sizeof(uintptr_t)) || rd(r, ud, &qn, 4)) return -1;
 		futex_queue *q = get_or_make_queue(t, addr);
-		for (uint32_t j = 0; j < qn; j++) { uint32_t tid; if (rd(r, ud, &tid, 4)) return -1; queue_push(q, tid, 0); /* savestate predates deadlines: infinite (re-parked timed on retry) */ }
+		if (v2) {
+			for (uint32_t j = 0; j < qn; j++) { uint32_t tid; uint64_t dl; if (rd(r, ud, &tid, 4) || rd(r, ud, &dl, 8)) return -1; queue_push(q, tid, dl); }
+		} else {
+		for (uint32_t j = 0; j < qn; j++) { uint32_t tid; if (rd(r, ud, &tid, 4)) return -1; queue_push(q, tid, 1); /* savestate predates deadlines: restore due (not infinite), so a waiter parked on a timed wait wakes with ETIMEDOUT on the next expiry pass and retries with a fresh deadline. An infinite waiter woken this way spuriously re-parks (callers re-check), exactly as native spurious wakeups. Leaving them infinite parks timer workers forever: the tick never resumes after a restore. */ }
+		}
 	}
 	if (rd(r, ud, magic, 14) || memcmp(magic, "GuestThreadSet", 14) != 0) return -1;
 	gthread *main = find_thread(t, 1);
