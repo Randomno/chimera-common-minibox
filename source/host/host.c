@@ -10,6 +10,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <unistd.h>
+#include <pthread.h>
 
 struct mb_host {
 	mb_fs *fs;
@@ -42,7 +44,7 @@ struct mb_host {
 /* ---- syscall numbers (x86-64) ---- */
 enum {
 	NR_read=0, NR_write=1, NR_open=2, NR_close=3, NR_dup=32, NR_stat=4, NR_fstat=5, NR_lseek=8,
-	NR_mmap=9, NR_mprotect=10, NR_munmap=11, NR_brk=12, NR_rt_sigprocmask=14,
+	NR_mmap=9, NR_mprotect=10, NR_munmap=11, NR_brk=12, NR_rt_sigaction=13, NR_rt_sigprocmask=14,
 	NR_ioctl=16, NR_readv=19, NR_writev=20, NR_sched_yield=24, NR_mremap=25, NR_madvise=28,
 	NR_nanosleep=35, NR_getpid=39, NR_exit=60, NR_truncate=76, NR_ftruncate=77,
 	NR_getppid=110, NR_gettid=186, NR_futex=202, NR_sched_setaffinity=203, NR_sched_getaffinity=204, NR_pread64=17, NR_sysinfo=99, NR_prctl=157, NR_openat=257, NR_newfstatat=262, NR_set_thread_area=205, NR_clock_nanosleep=230,
@@ -50,10 +52,11 @@ enum {
 	NR_fsync=74, NR_fdatasync=75, NR_sync=162, NR_syncfs=306,
 	NR_getuid=102, NR_getgid=104, NR_geteuid=107, NR_getegid=108, NR_wbx_clone=2000,
 	NR_tkill=200, NR_exit_group=231, NR_tgkill=234,
-	NR_readlink=89, NR_readlinkat=267
+	NR_readlink=89, NR_readlinkat=267, NR_pipe=22, NR_pipe2=293,
 };
 
 #define MAP_ANONYMOUS 0x20
+#define MAP_FIXED 0x10
 #define MAP_STACK 0x20000
 #define MAP_FIXED_NOREPLACE 0x100000
 #define MADV_DONTNEED 4
@@ -188,6 +191,17 @@ static bool record_death(mb_context *c, const char *fmt, va_list ap) {
 	}
 	if (c == NULL) return false;
 	c->dead = 1;
+	/* Death-site backtrace (host VA == guest VA). */
+	{
+		uint64_t *sp = (uint64_t *)c->guest_rsp;
+		uint32_t atid = h && h->threads ? mb_threads_active_tid(h->threads) : 0;
+		mb_diag("  active tid=%u rsp=%lx stack:", atid, (unsigned long)c->guest_rsp);
+		char sb[2048]; size_t so = 0;
+		for (int i = 0; i < 96 && so + 20 < sizeof sb; i++)
+			so += (size_t)snprintf(sb + so, sizeof sb - so, " %lx", (unsigned long)sp[i]);
+		sb[so] = '\0';
+		mb_diag("%s\n", sb);
+	}
 	const bool escapable = c->esc_rsp != 0;
 	mb_diag(escapable
 		? "  the call returns to the host, and the machine runs nothing until a state is loaded\n"
@@ -251,8 +265,10 @@ static uintptr_t MB_SYSV dispatch(uintptr_t a1, uintptr_t a2, uintptr_t a3, uint
 	if (!trace_syscalls()) {
 		res = dispatch_inner(a1, a2, a3, a4, a5, a6, nr, hp);
 	} else {
-		fprintf(stderr, "[syscall] %llu (%llx, %llx, %llx)", (unsigned long long)nr,
-		        (unsigned long long)a1, (unsigned long long)a2, (unsigned long long)a3);
+		fprintf(stderr, "[syscall] %llu (%llx, %llx, %llx, %llx, %llx, %llx)",
+		        (unsigned long long)nr,
+		        (unsigned long long)a1, (unsigned long long)a2, (unsigned long long)a3,
+		        (unsigned long long)a4, (unsigned long long)a5, (unsigned long long)a6);
 		fflush(stderr);
 		res = dispatch_inner(a1, a2, a3, a4, a5, a6, nr, hp);
 		intptr_t s = (intptr_t)res;
@@ -342,7 +358,13 @@ static uintptr_t MB_SYSV dispatch_inner(uintptr_t a1, uintptr_t a2, uintptr_t a3
 			if (flags & MAP_STACK) { if (prot == MB_PROT_RW) prot = MB_PROT_RWSTACK; else return serr(EINVAL); }
 			bool no_replace = (flags & MAP_FIXED_NOREPLACE) != 0;
 			/* the kernel rounds an unaligned length up to a page; so do we */
-			mb_range r = { a1, (a2 + 0xFFF) & ~(uintptr_t)0xFFF };
+			uintptr_t len = (a2 + 0xFFF) & ~(uintptr_t)0xFFF;
+			/* a bare hint is not a demand: only MAP_FIXED/NOREPLACE pins
+			 * the address (and only the arena can back it). Plain hints
+			 * outside the arena allocate anywhere, as on a kernel that
+			 * cannot satisfy the hint. */
+			bool pinned = ((flags & MAP_FIXED) != 0) || no_replace;
+			mb_range r = { pinned ? a1 : 0, len };
 			mb_sword res = mb_block_mmap(h->block, r, prot, h->layout.mmap_arena, no_replace);
 			/* A request bigger than the whole arena is not a tight fit, it is a
 			 * mistake - a corrupted size, or a reservation nobody sized against
@@ -386,6 +408,11 @@ static uintptr_t MB_SYSV dispatch_inner(uintptr_t a1, uintptr_t a2, uintptr_t a3
 		                 mb_sword r = mb_fs_stat_name(h->fs, p, (void *)a2); return r < 0 ? serr((int)-r) : sok(0); }
 		case NR_fstat: { mb_sword r = mb_fs_stat_fd(h->fs, (int)a1, (void *)a2); return r < 0 ? serr((int)-r) : sok(0); }
 		case NR_ioctl: return sok(0);
+		/* No pipes in-guest (musl's posix_spawn, backing system(),
+		 * needs pipe2 and fails here; without an in-guest provider
+		 * this stays unreachable).
+		 * A caller that needs one must cope with ENOSYS. */
+		case NR_pipe: case NR_pipe2: return serr(ENOSYS);
 		case NR_read:  { mb_sword r = mb_fs_read(h->fs, (int)a1, (uint8_t *)a2, a3); return r < 0 ? serr((int)-r) : sok(r); }
 		case NR_write: {
 			const uint64_t before = mb_fs_sysout_total(h->fs);
@@ -487,7 +514,14 @@ static uintptr_t MB_SYSV dispatch_inner(uintptr_t a1, uintptr_t a2, uintptr_t a3
 		case NR_ftruncate: { mb_sword r = mb_fs_truncate_fd(h->fs, (int)a1, (mb_sword)a2); return r < 0 ? serr((int)-r) : sok(0); }
 		case NR_clock_gettime: {
 			int64_t *ts = (int64_t *)a2;  /* {tv_sec, tv_nsec} */
-			ts[0] = 1495889068; ts[1] = 0; return sok(0);
+			/* Observation advances virtual time (a spinning try consumes
+			 * time, like native) and expires due deadlines; then yield so
+			 * expired others can run (a deadline-bounded pause-spin would
+			 * otherwise starve them with no syscalls of its own). */
+			mb_threads_tick(h->threads);
+			uint64_t now = mb_threads_clock_get(h->threads);
+			ts[0] = (int64_t)(now / 1000000000ull); ts[1] = (int64_t)(now % 1000000000ull);
+			return mb_threads_yield(h->threads, &h->context);
 		}
 		case NR_getrandom: {
 			/* Determinism is the whole contract, so randomness cannot be real:
@@ -531,6 +565,8 @@ static uintptr_t MB_SYSV dispatch_inner(uintptr_t a1, uintptr_t a2, uintptr_t a3
 		case NR_fsync: case NR_fdatasync: case NR_syncfs:
 			/* the same, for one descriptor: it is flushed if it is open at all */
 			{ mb_sword r = mb_fs_sync_fd(h->fs, (int)a1); return r < 0 ? serr((int)-r) : sok(0); }
+		case NR_rt_sigaction: return sok(0);   /* no signal delivery in-guest;
+		                                           install accepted, never fires */
 		case NR_rt_sigprocmask: return sok(0);
 		case NR_tkill: case NR_tgkill: {
 			/* A signal to one of its own threads. The one a guest sends is to itself:
@@ -559,8 +595,23 @@ static uintptr_t MB_SYSV dispatch_inner(uintptr_t a1, uintptr_t a2, uintptr_t a3
 		 * privileged and no path is taken for one user and not another. */
 		case NR_getuid: case NR_geteuid: return sok(1000);
 		case NR_getgid: case NR_getegid: return sok(1000);
-		case NR_sched_yield: case NR_nanosleep: case NR_clock_nanosleep:
+		case NR_sched_yield: case NR_nanosleep: case NR_clock_nanosleep: {
+			/* Sleeping advances the logical clock by the requested
+			 * duration (deterministic pacing); plain yield costs nothing. */
+			if (nr == (uintptr_t)NR_nanosleep && a1 != 0) {
+				int64_t *ts = (int64_t *)a1;
+				mb_threads_clock_advance(h->threads,
+				    (uint64_t)ts[0] * 1000000000ull + (uint64_t)ts[1]);
+			} else if (nr == (uintptr_t)NR_clock_nanosleep && a3 != 0) {
+				int64_t *ts = (int64_t *)a3; /* (clockid=a1, flags=a2) */
+				uint64_t v = (uint64_t)ts[0] * 1000000000ull + (uint64_t)ts[1];
+				if ((a2 & 1) /* TIMER_ABSTIME */) {
+					uint64_t now = mb_threads_clock_get(h->threads);
+					if (v > now) mb_threads_clock_advance(h->threads, v - now);
+				} else mb_threads_clock_advance(h->threads, v);
+			}
 			return mb_threads_yield(h->threads, &h->context);
+		}
 		case NR_wbx_clone: {
 			/* args: (tls/thread_area, child_rsp, child_rip, child_tid, parent_tid*) */
 			mb_sword r = mb_threads_spawn(h->threads, h->block, a1, a2, a3, a4, (uint32_t *)a5);
@@ -598,12 +649,21 @@ static uintptr_t MB_SYSV dispatch_inner(uintptr_t a1, uintptr_t a2, uintptr_t a3
 			return r;
 		}
 		case NR_futex: {
-			/* CLOCK_REALTIME only picks which clock a timeout is against, and a
-			 * timeout is not honoured here at all (see the bitset ops below). */
+			/* CLOCK_REALTIME only picks which clock a timeout is against, and
+			 * our logical clock IS CLOCK_REALTIME-epoch (same constant). */
 			int op = (int)a2 & ~(FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME);
+			/* deadline_ns: 0 = infinite. FUTEX_WAIT takes a RELATIVE
+			 * timeout, FUTEX_WAIT_BITSET an ABSOLUTE one. */
+			uint64_t fut_dl = 0;
+			if (a4 != 0) {
+				int64_t *ts = (int64_t *)a4;
+				uint64_t v = (uint64_t)ts[0] * 1000000000ull + (uint64_t)ts[1];
+				if (op == FUTEX_WAIT_BITSET) fut_dl = v;
+				else fut_dl = mb_threads_clock_get(h->threads) + v;
+			}
 			switch (op) {
-				case FUTEX_WAIT: return mb_threads_futex_wait(h->threads, &h->context, a1, (uint32_t)a3);
-				case FUTEX_WAKE: return sok(mb_threads_futex_wake(h->threads, a1, (uint32_t)a3));
+				case FUTEX_WAIT: return mb_threads_futex_wait(h->threads, &h->context, a1, (uint32_t)a3, fut_dl);
+				case FUTEX_WAKE: return mb_threads_futex_wake(h->threads, &h->context, a1, (uint32_t)a3);
 				/* The bitset pair is the plain pair with a mask and an ABSOLUTE
 				 * timeout. Rust's std reaches for these - its Mutex, Condvar and
 				 * thread::park all wait this way - so a guest built from it spun
@@ -615,11 +675,14 @@ static uintptr_t MB_SYSV dispatch_inner(uintptr_t a1, uintptr_t a2, uintptr_t a3
 				 * which every futex user must already tolerate, because it
 				 * re-checks its own condition on waking. So: match any.
 				 *
-				 * The timeout is ignored, exactly as FUTEX_WAIT's relative one
-				 * already is. A waiter here is woken by another guest thread or
-				 * not at all; there is no clock in the box to expire against. */
-				case FUTEX_WAIT_BITSET: return mb_threads_futex_wait(h->threads, &h->context, a1, (uint32_t)a3);
-				case FUTEX_WAKE_BITSET: return sok(mb_threads_futex_wake(h->threads, a1, (uint32_t)a3));
+				 * The timeout is honored against the logical clock
+				 * (threading.c): relative for FUTEX_WAIT, absolute for
+				 * FUTEX_WAIT_BITSET. With no runnable threads, expiry
+				 * fast-forwards the clock to the earliest deadline and
+				 * unparks that waiter with ETIMEDOUT. Callers must
+				 * tolerate it exactly like a real timeout (they re-check). */
+				case FUTEX_WAIT_BITSET: return mb_threads_futex_wait(h->threads, &h->context, a1, (uint32_t)a3, fut_dl);
+				case FUTEX_WAKE_BITSET: return mb_threads_futex_wake(h->threads, &h->context, a1, (uint32_t)a3);
 				case FUTEX_REQUEUE: return sok(mb_threads_futex_requeue(h->threads, a1, a5, (uint32_t)a3, (uint32_t)a4));
 				case FUTEX_LOCK_PI: return mb_threads_futex_lock_pi(h->threads, &h->context, a1);
 				case FUTEX_UNLOCK_PI: return mb_threads_futex_unlock_pi(h->threads, &h->context, a1);
@@ -749,6 +812,33 @@ void mb_host_destroy(mb_host *h) {
 
 uintptr_t mb_host_proc_addr_raw(mb_host *h, const char *name);
 
+/* Spin sampler (MB_SAMPLE_SECS=N). A helper thread prints the
+ * active green thread + guest rsp + stack top every N seconds. Racy reads
+ * are fine for diagnosis (may tear). Locates non-syscall spins.
+ * POSIX-only (pthreads): unavailable on Windows. */
+#ifndef _WIN32
+static struct mb_host *sample_h;
+static pthread_t sample_thr;
+static int sample_started;
+static void *sample_fn(void *arg) {
+	(void)arg;
+	const char *e = getenv("MB_SAMPLE_SECS");
+	int secs = e ? atoi(e) : 0;
+	if (secs <= 0) return NULL;
+	for (;;) {
+		sleep(secs);
+		struct mb_host *h = sample_h;
+		if (!h || !h->active) continue;
+		uint64_t *sp = (uint64_t *)h->context.guest_rsp;
+		fprintf(stderr, "[S] active=%u rsp=%lx stack:",
+		        mb_threads_active_tid(h->threads),
+		        (unsigned long)h->context.guest_rsp);
+		for (int i = 0; i < 12; i++) fprintf(stderr, " %lx", (unsigned long)sp[i]);
+		fprintf(stderr, "\n");
+	}
+	return NULL;
+}
+#endif
 void mb_host_activate(mb_host *h) {
 #ifndef _WIN32
 	/* guest code will run on THIS thread; make signal delivery on a faulting
@@ -763,6 +853,13 @@ void mb_host_activate(mb_host *h) {
 	 * guest, so the host-to-guest adapter (a host thread entering) would
 	 * find no entry context to save. The guest ABI is spelled in the type. */
 	mb_tripguard_set_guest_fault_handler((mb_guest_fault_fn)mb_host_proc_addr_raw(h, "GuestFaultHandler"));
+#ifndef _WIN32
+	if (!sample_started && getenv("MB_SAMPLE_SECS")) {
+		sample_started = 1; sample_h = h;
+		pthread_create(&sample_thr, NULL, sample_fn, NULL);
+		pthread_detach(sample_thr);
+	}
+#endif
 	if (h->active) return;
 	mb_prepare_thread();
 	h->context.host_ptr = (uintptr_t)h;

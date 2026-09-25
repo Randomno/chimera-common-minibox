@@ -30,14 +30,31 @@ typedef struct {
 	mb_range pending;      /* a munmap of that stack, held until it has left it */
 } gthread;
 
-typedef struct { uintptr_t addr; uint32_t *tids; size_t n, cap; } futex_queue;
+/* Timed-wait expiry on deadlock. Native threads use TIMED futex
+ * waits (timeouts fire, callers retry) for handshakes; ignoring timeouts
+ * deadlocks green threads that would otherwise make progress. There is no
+ * clock in the box, so expiry is logical, not temporal: when NO thread is
+ * runnable, the earliest-parked waiter that HAD a timeout is unparked with
+ * ETIMEDOUT instead of declaring death. Fully deterministic (park order
+ * is guest-determined); callers must tolerate it exactly like a real
+ * early/spurious timeout (they re-check + retry). Infinite waiters still
+ * deadlock (genuine). */
+typedef struct { uintptr_t addr; uint32_t *tids; uint64_t *deadline; size_t n, cap; } futex_queue;
 
 struct mb_threads {
 	uint32_t next_tid;
 	uint32_t active_tid;
 	gthread *threads; size_t nthreads, cap;   /* kept sorted by tid ascending */
 	futex_queue *futicies; size_t nfut, futcap;
+	/* Logical CLOCK_REALTIME (ns). clock_gettime is frozen by design
+	 * (deterministic replay), so timed waits can only expire against
+	 * a clock that advances when they do: no-runnable expiry
+	 * fast-forwards it to the earliest deadline, and nanosleep advances
+	 * it by its duration. Starts at the same constant clock_gettime
+	 * always returned. */
+	uint64_t clock_ns;
 };
+#define MB_CLOCK_INIT_NS (1495889068ull * 1000000000ull)
 
 /* ---- thread array (sorted by tid) ---- */
 static gthread *find_thread(mb_threads *t, uint32_t tid) {
@@ -65,16 +82,25 @@ static futex_queue *get_or_make_queue(mb_threads *t, uintptr_t addr) {
 	if (q) return q;
 	if (t->nfut == t->futcap) { t->futcap = t->futcap ? t->futcap*2 : 4; t->futicies = realloc(t->futicies, t->futcap*sizeof(futex_queue)); }
 	q = &t->futicies[t->nfut++];
-	q->addr = addr; q->tids = NULL; q->n = 0; q->cap = 0;
+	q->addr = addr; q->tids = NULL; q->deadline = NULL; q->n = 0; q->cap = 0;
 	return q;
 }
-static void queue_push(futex_queue *q, uint32_t tid) {
-	if (q->n == q->cap) { q->cap = q->cap ? q->cap*2 : 4; q->tids = realloc(q->tids, q->cap*sizeof(uint32_t)); }
-	q->tids[q->n++] = tid;
+static void queue_push(futex_queue *q, uint32_t tid, uint64_t deadline_ns) {
+	if (q->n == q->cap) {
+		q->cap = q->cap ? q->cap*2 : 4;
+		q->tids = realloc(q->tids, q->cap*sizeof(uint32_t));
+		q->deadline = realloc(q->deadline, q->cap*sizeof(uint64_t));
+	}
+	q->tids[q->n] = tid; q->deadline[q->n] = deadline_ns; q->n++;
+}
+static void queue_remove_at(futex_queue *q, size_t i) {
+	memmove(&q->tids[i], &q->tids[i+1], (q->n-i-1)*sizeof(uint32_t));
+	memmove(&q->deadline[i], &q->deadline[i+1], (q->n-i-1)*sizeof(uint64_t));
+	q->n--;
 }
 static void remove_queue(mb_threads *t, uintptr_t addr) {
 	for (size_t i = 0; i < t->nfut; i++)
-		if (t->futicies[i].addr == addr) { free(t->futicies[i].tids); memmove(&t->futicies[i], &t->futicies[i+1], (t->nfut-i-1)*sizeof(futex_queue)); t->nfut--; return; }
+		if (t->futicies[i].addr == addr) { free(t->futicies[i].tids); free(t->futicies[i].deadline); memmove(&t->futicies[i], &t->futicies[i+1], (t->nfut-i-1)*sizeof(futex_queue)); t->nfut--; return; }
 }
 
 /* returns tid unparked (and whether more remain), or -1 */
@@ -82,25 +108,99 @@ static int unpark_one(mb_threads *t, uintptr_t addr, uint32_t *out_tid, bool *ha
 	futex_queue *q = find_queue(t, addr);
 	if (!q || q->n == 0) return -1;
 	uint32_t tid = q->tids[0];
-	memmove(&q->tids[0], &q->tids[1], (q->n-1)*sizeof(uint32_t)); q->n--;
+	queue_remove_at(q, 0);
 	gthread *g = find_thread(t, tid); if (g) g->state = T_RUNNABLE;
 	*out_tid = tid;
 	if (q->n == 0) { remove_queue(t, addr); *has_more = false; } else *has_more = true;
 	return 0;
 }
-
+/* earliest deadline anywhere (0 = none timed); victim indices for it.
+ * Queues are FIFO per addr, addrs scanned in creation order: the victim
+ * is guest-deterministic. */
+static int unpark_earliest_deadline(mb_threads *t, uint32_t *out_tid, uint64_t *out_dl) {
+	uint64_t best = 0;
+	int bi = -1; size_t bj = 0;
+	for (size_t i = 0; i < t->nfut; i++) {
+		futex_queue *q = &t->futicies[i];
+		for (size_t j = 0; j < q->n; j++)
+			if (q->deadline[j] != 0 && (best == 0 || q->deadline[j] < best)) {
+				best = q->deadline[j]; bi = (int)i; bj = j;
+			}
+	}
+	if (bi < 0) return -1;
+	futex_queue *q = &t->futicies[bi];
+	uint32_t tid = q->tids[bj];
+	queue_remove_at(q, bj);
+	gthread *g = find_thread(t, tid); if (g) g->state = T_RUNNABLE;
+	*out_tid = tid; *out_dl = best;
+	if (q->n == 0) remove_queue(t, q->addr);
+	return 0;
+}
+/* unpark every waiter whose deadline has passed (each gets ETIMEDOUT
+ * when next scheduled); returns count. Called on every futex_wait so
+ * due deadlines fire even while other threads stay runnable. */
+static int expire_due(mb_threads *t) {
+	int n = 0;
+	for (;;) {
+		/* earliest DUE deadline (<= clock) */
+		uint64_t best = 0;
+		int bi = -1; size_t bj = 0;
+		for (size_t i = 0; i < t->nfut; i++) {
+			futex_queue *q = &t->futicies[i];
+			for (size_t j = 0; j < q->n; j++)
+				if (q->deadline[j] != 0 && q->deadline[j] <= t->clock_ns &&
+				    (best == 0 || q->deadline[j] < best)) {
+					best = q->deadline[j]; bi = (int)i; bj = j;
+				}
+		}
+		if (bi < 0) return n;
+		futex_queue *q = &t->futicies[bi];
+		uint32_t victim = q->tids[bj];
+		queue_remove_at(q, bj);
+		gthread *g = find_thread(t, victim);
+		if (g) { g->state = T_RUNNABLE; g->rax = serr(ETIMEDOUT); }
+		if (q->n == 0) remove_queue(t, q->addr);
+		TDBG("futex_expire_due tid=%u\n", victim);
+		n++;
+	}
+}
 /* ---- lifecycle ---- */
 mb_threads *mb_threads_new(void) {
 	mb_threads *t = calloc(1, sizeof(mb_threads));
 	t->next_tid = 2;
 	t->active_tid = 1;
+	t->clock_ns = MB_CLOCK_INIT_NS;
 	gthread main_thread = { 1, T_RUNNABLE, sok(0), 0, 0, 0 };
 	insert_thread(t, main_thread);
 	return t;
 }
+
+/* logical clock accessors (host.c: clock_gettime/nanosleep). */
+uint64_t mb_threads_clock_get(mb_threads *t) { return t ? t->clock_ns : MB_CLOCK_INIT_NS; }
+void mb_threads_clock_advance(mb_threads *t, uint64_t delta_ns) { if (t) t->clock_ns += delta_ns; }
+uint32_t mb_threads_active_tid(mb_threads *t) { return t ? t->active_tid : 0; }
+/* time-read tick: observation advances virtual time (a spinning try
+ * consumes time, like native), then due deadlines expire. Deterministic
+ * (observation-counted). Lets deadline-bounded pause-spins converge. */
+void mb_threads_tick(mb_threads *t) {
+	if (!t) return;
+	/* Observation advances virtual time (a spinning try consumes time,
+	 * like native), then due deadlines expire. Deterministic
+	 * (observation-counted). MB_TICK_NS overrides the step (default 1us:
+	 * 1ms steps caused false futex timeouts — a microsecond main-thread
+	 * spin consumed milliseconds — while 0 froze deadline-spins; 1us
+	 * lets both converge (verified against deadline-bounded pause-spins). */
+	static long long tick_ns = -1;
+	if (tick_ns < 0) {
+		const char *e = getenv("MB_TICK_NS");
+		tick_ns = e ? atoll(e) : 1000ll;
+	}
+	t->clock_ns += (uint64_t)tick_ns;
+	expire_due(t);
+}
 void mb_threads_free(mb_threads *t) {
 	if (!t) return;
-	for (size_t i = 0; i < t->nfut; i++) free(t->futicies[i].tids);
+	for (size_t i = 0; i < t->nfut; i++) { free(t->futicies[i].tids); free(t->futicies[i].deadline); }
 	free(t->futicies); free(t->threads); free(t);
 }
 
@@ -124,6 +224,16 @@ static uintptr_t swap_to_next(mb_threads *t, mb_context *c, uintptr_t ret) {
 		for (size_t i = 0; i < t->nthreads; i++)
 			if (t->threads[i].state == T_RUNNABLE) { best = t->threads[i].tid; found = true; break; }
 	if (!found) {
+		/* no runnable thread: fast-forward the logical clock to the
+		 * earliest timed-wait deadline and expire that waiter with
+		 * ETIMEDOUT (see futex_queue note). Genuine all-infinite
+		 * deadlock still stops the machine. */
+		uint32_t victim = 0; uint64_t dl = 0;
+		if (unpark_earliest_deadline(t, &victim, &dl) == 0) {
+			if (dl > t->clock_ns) t->clock_ns = dl;
+			TDBG("futex_expire tid=%u clock=%llu\n", victim, (unsigned long long)t->clock_ns);
+			return swap_to(t, c, victim, serr(ETIMEDOUT));
+		}
 		/* every thread waits on another and none is left to wake them: a
 		 * deadlock, which on real hardware is a hang - here it stops the machine */
 		char states[160]; size_t o = 0;
@@ -137,13 +247,20 @@ static uintptr_t swap_to_next(mb_threads *t, mb_context *c, uintptr_t ret) {
 	return swap_to(t, c, best, ret);
 }
 
-static uintptr_t park_me(mb_threads *t, mb_context *c, uintptr_t ret, uintptr_t addr) {
-	queue_push(get_or_make_queue(t, addr), t->active_tid);
+static uintptr_t park_me(mb_threads *t, mb_context *c, uintptr_t ret, uintptr_t addr, uint64_t deadline_ns) {
+	queue_push(get_or_make_queue(t, addr), t->active_tid, deadline_ns);
 	find_thread(t, t->active_tid)->state = T_WAITING;
+	/* Wait-site backtrace (host VA == guest VA). */
+	if (mb_tdbg()) {
+		uint64_t *sp = (uint64_t *)c->guest_rsp;
+		fprintf(stderr, "[T] park tid=%u rsp=%lx stack:", t->active_tid, (unsigned long)c->guest_rsp);
+		for (int i = 0; i < 64; i++) fprintf(stderr, " %lx", (unsigned long)sp[i]);
+		fprintf(stderr, "\n");
+	}
 	return swap_to_next(t, c, ret);
 }
 static void park_other(mb_threads *t, uintptr_t addr, uint32_t tid) {
-	queue_push(get_or_make_queue(t, addr), tid);
+	queue_push(get_or_make_queue(t, addr), tid, 0);
 	find_thread(t, tid)->state = T_WAITING;
 }
 
@@ -151,7 +268,11 @@ static void park_other(mb_threads *t, uintptr_t addr, uint32_t tid) {
 mb_sword mb_threads_spawn(mb_threads *t, mb_block *b, uintptr_t thread_area,
                       uintptr_t guest_rsp, uintptr_t guest_rip, uintptr_t child_tid, uint32_t *parent_tid) {
 	uint32_t tid = t->next_tid;
-	/* the musl pthread struct: words 12,13 are stack_end and stack_size */
+	/* thread_area carries the musl pthread struct (words 12,13 are
+	 * stack_end/size). A NULL area is a foreign convention (musl's own
+	 * __clone, which speaks raw clone, not wbx_clone): refuse with EINVAL
+	 * instead of faulting the host on pthread[12]. */
+	if (thread_area == 0) return -EINVAL;
 	const uintptr_t *pthread = (const uintptr_t *)thread_area;
 	uintptr_t stack_end = pthread[12], stack_size = pthread[13];
 	mb_range stack = { stack_end - stack_size, stack_size };
@@ -211,10 +332,18 @@ bool mb_threads_take_held_unmap(mb_threads *t, mb_range *out) {
 	return true;
 }
 
-uintptr_t mb_threads_futex_wait(mb_threads *t, mb_context *c, uintptr_t addr, uint32_t compare) {
-	uint32_t cur=*(uint32_t*)addr; TDBG("futex_wait tid=%u addr=%lx cur=%u cmp=%u\n",t->active_tid,(unsigned long)addr,cur,compare);
+uintptr_t mb_threads_futex_wait(mb_threads *t, mb_context *c, uintptr_t addr, uint32_t compare, uint64_t deadline_ns) {
+	expire_due(t); /* due deadlines fire even while others stay runnable */
+	uint32_t cur=*(uint32_t*)addr; TDBG("futex_wait tid=%u addr=%lx cur=%u cmp=%u dl=%llu\n",t->active_tid,(unsigned long)addr,cur,compare,(unsigned long long)deadline_ns);
 	if (cur != compare) return serr(EAGAIN);
-	return park_me(t, c, sok(0), addr);
+	if (deadline_ns != 0 && deadline_ns <= t->clock_ns) {
+		/* Already due: spin forward (a spinning try consumes virtual
+		 * time, like native) and yield so expired others can run; the
+		 * try itself reports expiry (spurious-safe: callers re-check). */
+		t->clock_ns += 1000000ull; /* 1ms per instant expiry */
+		return swap_to_next(t, c, serr(ETIMEDOUT));
+	}
+	return park_me(t, c, sok(0), addr, deadline_ns);
 }
 
 mb_sword mb_threads_futex_requeue(mb_threads *t, uintptr_t from, uintptr_t to, uint32_t wake, uint32_t requeue) {
@@ -229,16 +358,23 @@ mb_sword mb_threads_futex_requeue(mb_threads *t, uintptr_t from, uintptr_t to, u
 	}
 	return count;
 }
-mb_sword mb_threads_futex_wake(mb_threads *t, uintptr_t addr, uint32_t count) {
+mb_sword mb_threads_futex_wake(mb_threads *t, mb_context *c, uintptr_t addr, uint32_t count) {
 	TDBG("futex_wake tid=%u addr=%lx count=%u\n",t->active_tid,(unsigned long)addr,count);
-	return mb_threads_futex_requeue(t, addr, 0, count, 0);
+	mb_sword n = mb_threads_futex_requeue(t, addr, 0, count, 0);
+	/* Yield-after-wake: a woken thread is runnable but never runs until
+	 * someone yields/parks; a waker spinning without syscalls (pause
+	 * loop) would starve it (native preemption covers this). Yielding
+	 * here hands off deterministically (round-robin); a no-op when
+	 * nobody else is runnable. */
+	if (n > 0) return swap_to_next(t, c, sok((uintptr_t)n));
+	return n;
 }
 
 uintptr_t mb_threads_futex_lock_pi(mb_threads *t, mb_context *c, uintptr_t addr) {
 	uint32_t *atom = (uint32_t *)addr;
 	if (*atom == 0) { *atom = t->active_tid; return sok(0); }
 	*atom |= FUTEX_WAITERS;
-	return park_me(t, c, sok(0), addr);
+	return park_me(t, c, sok(0), addr, 0);
 }
 uintptr_t mb_threads_futex_unlock_pi(mb_threads *t, mb_context *c, uintptr_t addr) {
 	uint32_t *atom = (uint32_t *)addr;
@@ -303,7 +439,7 @@ int mb_threads_load(mb_threads *t, mb_context *c, mb_read_cb r, uintptr_t ud) {
 		uintptr_t addr; uint32_t qn;
 		if (rd(r, ud, &addr, sizeof(uintptr_t)) || rd(r, ud, &qn, 4)) return -1;
 		futex_queue *q = get_or_make_queue(t, addr);
-		for (uint32_t j = 0; j < qn; j++) { uint32_t tid; if (rd(r, ud, &tid, 4)) return -1; queue_push(q, tid); }
+		for (uint32_t j = 0; j < qn; j++) { uint32_t tid; if (rd(r, ud, &tid, 4)) return -1; queue_push(q, tid, 0); /* savestate predates deadlines: infinite (re-parked timed on retry) */ }
 	}
 	if (rd(r, ud, magic, 14) || memcmp(magic, "GuestThreadSet", 14) != 0) return -1;
 	gthread *main = find_thread(t, 1);

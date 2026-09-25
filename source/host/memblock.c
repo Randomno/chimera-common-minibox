@@ -944,8 +944,8 @@ static mb_sword mmap_impl(mb_block *b, mb_range addr, mb_prot prot, mb_range are
 				}
 				if (bl == 0) break;
 				reported[shown] = bs;
-				mb_diag("[mmap]   %zu MiB at +%zu MiB\n", (size_t)((bl << MB_PAGESHIFT) >> 20),
-				        (size_t)(((bs - as) << MB_PAGESHIFT) >> 20));
+			mb_diag("[mmap]   %zu MiB at +%zu MiB\n", (size_t)((bl << MB_PAGESHIFT) >> 20),
+			        (size_t)(((bs - as) << MB_PAGESHIFT) >> 20));
 			}
 			return -ENOMEM;
 		}
@@ -1027,7 +1027,7 @@ int mb_block_madvise_dontneed(mb_block *b, mb_range addr) {
 
 /* in-place mremap only (grow needs following pages free; shrink munmaps tail) */
 static mb_sword mremap_impl(mb_block *b, mb_range addr, uintptr_t new_size, mb_range arena) {
-	(void)arena;
+	get_stack_dirty(b);
 	if (addr.size == 0 || new_size == 0) return -EINVAL;
 	if (addr.start == 0) return -ENOSYS; /* move path unreachable in the reference */
 	size_t pcount, ps = validate(b, addr, &pcount);
@@ -1038,10 +1038,31 @@ static mb_sword mremap_impl(mb_block *b, mb_range addr, uintptr_t new_size, mb_r
 		if (fs == (size_t)-1) return -EINVAL;
 		for (size_t i = ps; i < ps + pcount; i++)
 			if (b->pages[i].status == MB_ST_FREE) return -EINVAL;
+		bool blocked = false;
 		for (size_t i = ps + pcount; i < fs + fcount; i++)
-			if (b->pages[i].status != MB_ST_FREE) return -EEXIST;
-		set_protections(b, ps + pcount, fcount - pcount, b->pages[ps].status);
-		return (mb_sword)addr.start;
+			if (b->pages[i].status != MB_ST_FREE) { blocked = true; break; }
+		if (!blocked) {
+			set_protections(b, ps + pcount, fcount - pcount, b->pages[ps].status);
+			return (mb_sword)addr.start;
+		}
+		/* Dense packing has no gaps: a kernel with free address space would
+		 * grow in place, so relocate instead (same observable: success +
+		 * valid mapping at the returned address). The caller must use the
+		 * return value, which mremap guarantees even with MAYMOVE.
+		 * Inner helpers: we already hold the track lock. */
+		uint8_t st = b->pages[ps].status;
+		mb_sword nr = mmap_impl(b, (mb_range){ 0, new_size },
+		                        status_prot(st), arena, false);
+		if (nr < 0) return nr;
+		size_t nps = ((uintptr_t)nr - b->addr.start) >> MB_PAGESHIFT;
+		for (size_t i = 0; i < pcount; i++) {
+			uintptr_t src = mirror_addr(b, addr.start + (i << MB_PAGESHIFT));
+			uintptr_t dst = mirror_addr(b, (uintptr_t)nr + (i << MB_PAGESHIFT));
+			set_dirty(b, nps + i, true);
+			memcpy((void *)dst, (const void *)src, MB_PAGESIZE);
+		}
+		munmap_impl(b, addr, false);
+		return nr;
 	} else {
 		for (size_t i = ps; i < ps + pcount; i++)
 			if (b->pages[i].status == MB_ST_FREE) return -EINVAL;

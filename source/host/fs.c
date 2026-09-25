@@ -23,6 +23,7 @@
 #include <windows.h>
 #endif
 #include <errno.h>
+#include <fcntl.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -240,6 +241,9 @@ mb_sword mb_fs_open(mb_fs *fs, const char *name, int flags) {
 		case O_RDWR:   if (!can_read || !can_write) return -EACCES; break;
 		default: return -EINVAL;
 	}
+	/* O_TRUNC on a writable regular mount drops its content (new handles
+	 * start at position 0, so no position fixup is needed here). */
+	if ((flags & O_TRUNC) && can_write && f->kind == F_REGULAR) f->len = 0;
 	return handle_add(fs, idx)->fd;
 }
 

@@ -18,8 +18,14 @@ uint32_t  mb_threads_get_tid(mb_threads *t);
 
 bool          mb_threads_hold_stack_unmap(mb_threads *t, mb_range r);
 bool          mb_threads_take_held_unmap(mb_threads *t, mb_range *out);
-uintptr_t mb_threads_futex_wait(mb_threads *t, mb_context *c, uintptr_t addr, uint32_t compare);
-mb_sword      mb_threads_futex_wake(mb_threads *t, uintptr_t addr, uint32_t count);
+uintptr_t mb_threads_futex_wait(mb_threads *t, mb_context *c, uintptr_t addr, uint32_t compare, uint64_t deadline_ns);
+/* logical CLOCK_REALTIME (ns): the frozen clock_gettime value, advanced by
+ * timed-wait expiry and nanosleep. Guest-deterministic (deadline-driven). */
+uint64_t      mb_threads_clock_get(mb_threads *t);
+void          mb_threads_clock_advance(mb_threads *t, uint64_t delta_ns);
+uint32_t      mb_threads_active_tid(mb_threads *t);
+void          mb_threads_tick(mb_threads *t);
+mb_sword      mb_threads_futex_wake(mb_threads *t, mb_context *c, uintptr_t addr, uint32_t count);
 mb_sword      mb_threads_futex_requeue(mb_threads *t, uintptr_t from, uintptr_t to, uint32_t wake, uint32_t requeue);
 uintptr_t mb_threads_futex_lock_pi(mb_threads *t, mb_context *c, uintptr_t addr);
 uintptr_t mb_threads_futex_unlock_pi(mb_threads *t, mb_context *c, uintptr_t addr);
