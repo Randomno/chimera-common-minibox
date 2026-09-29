@@ -17,3 +17,10 @@ test('conformance-guest', run_guest,
   suite: 'system',
   timeout: 120,
 )
+
+# Dropped-%fs repair: guest toolchain only (Linux), like the guest itself.
+test('conformance-fs-repair', run_guest,
+  args: ['--fs-repair-child', guest_wbx],
+  suite: 'system',
+  timeout: 120,
+)

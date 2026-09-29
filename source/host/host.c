@@ -192,14 +192,19 @@ static bool record_death(mb_context *c, const char *fmt, va_list ap) {
 	}
 	if (c == NULL) return false;
 	c->dead = 1;
-	/* Death-site backtrace (host VA == guest VA). */
+	/* Death-site backtrace (host VA == guest VA). A stale rsp - or one in a
+	 * guard page - must not take the reporter down with the guest: each
+	 * page is checked once, the way say_guest_stack does. */
 	{
 		uint64_t *sp = (uint64_t *)c->guest_rsp;
 		uint32_t atid = h && h->threads ? mb_threads_active_tid(h->threads) : 0;
 		mb_diag("  active tid=%u rsp=%lx stack:", atid, (unsigned long)c->guest_rsp);
 		char sb[2048]; size_t so = 0;
-		for (int i = 0; i < 96 && so + 20 < sizeof sb; i++)
+		for (int i = 0; i < 96 && so + 20 < sizeof sb; i++) {
+			uintptr_t a = (uintptr_t)&sp[i];
+			if ((i == 0 || (a & MB_PAGEMASK) == 0) && !mb_page_readable(a)) break;
 			so += (size_t)snprintf(sb + so, sizeof sb - so, " %lx", (unsigned long)sp[i]);
+		}
 		sb[so] = '\0';
 		mb_diag("%s\n", sb);
 	}

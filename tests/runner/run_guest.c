@@ -235,6 +235,47 @@ static int handler_does_not_recurse(const char *self, const char *guest) {
 }
 #endif
 
+#ifndef _WIN32
+/* The child half of the dropped-%fs check: what Windows does to the base at
+ * every scheduler quantum - the base reads 0 at a %fs access mid-guest, with
+ * the entry-parked host base still valid to check against. A fault in guest
+ * code must reinstall the live thread pointer and retry (once), even though
+ * this guest carries no PT_TLS and the host never swaps; the host's own base
+ * and the value read must be identical before and after. Then a genuine fault
+ * (WildWrite) must still kill the machine.
+ * Linux-only: the drop it simulates cannot happen here. */
+static int fs_repair_child(const char *guest) {
+	mb_return r;
+	mb_host *h = make_host(guest, 0xABCD);
+	wbx_activate_host(h, &r);
+	typedef uint64_t (MB_GUEST_ABI *u64_fn)(void);
+	typedef uint32_t (MB_GUEST_ABI *alive_fn)(void);
+	typedef void (MB_GUEST_ABI *void_fn)(void);
+	u64_fn FsProbe = (u64_fn)proc(h, "FsProbe");
+	u64_fn ClobberAndProbe = (u64_fn)proc(h, "ClobberAndProbe");
+	alive_fn Alive = (alive_fn)proc(h, "Alive");
+	uint64_t v1 = FsProbe();
+	CHECK(v1 != 0);
+	const uintptr_t f0 = host_fs_base();
+	CHECK(f0 != 0);
+	uint64_t v2 = ClobberAndProbe();
+	CHECK(Alive() == 0xA11FE);   /* survived: without the repair this is refused (0) */
+	uint64_t v3 = FsProbe();
+	CHECK(v3 == v1);             /* the host base, intact across the episode */
+	CHECK(host_fs_base() == f0); /* ...in the register too */
+	fprintf(stderr, "[fsrepair] v1=%llx v2=%llx v3=%llx\n",
+	        (unsigned long long)v1, (unsigned long long)v2, (unsigned long long)v3);
+	void *p = malloc(1024); CHECK(p != NULL); free(p);   /* host TLS works */
+	((void_fn)proc(h, "WildWrite"))();
+	char why[512];
+	wbx_get_death(h, why, sizeof why, &r);
+	CHECK(r.data == 1);
+	CHECK(Alive() == 0);   /* refused: a genuine fault still kills */
+	wbx_destroy_host(h, &r);
+	return fails != 0;
+}
+#endif
+
 /* A guest that aborts must leave its reason in the diagnostic log: the death
  * named as an abort, and what the guest last wrote to stderr. */
 static int guest_abort_is_reported(const char *self, const char *guest) {
@@ -342,6 +383,7 @@ int main(int argc, char **argv) {
 	if (argc > 2 && strcmp(argv[1], "--abort-child") == 0) return abort_child(argv[2]);
 #ifndef _WIN32
 	if (argc > 2 && strcmp(argv[1], "--host-fault-child") == 0) return host_fault_child(argv[2]);
+	if (argc > 2 && strcmp(argv[1], "--fs-repair-child") == 0) return fs_repair_child(argv[2]);
 #else
 	if (argc > 2 && strcmp(argv[1], "--handler-recursion-child") == 0) return handler_recursion_child(argv[2]);
 #endif

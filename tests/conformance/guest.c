@@ -232,6 +232,22 @@ __asm__(
 	"\txor %ecx, %ecx\n"
 	"\tdiv %ecx\n"
 	"\tret\n"
+	/* %fs:0 through whatever base is loaded: with the base dropped (what
+	 * Windows does at a scheduler quantum) this faults, the host reinstalls
+	 * the live thread pointer and retries, and the same value comes back. */
+	".globl FsProbe\n.type FsProbe,@function\n"
+	"FsProbe:\n"
+	"\tmov %fs:0, %rax\n"
+	"\tret\n"
+	/* The drop and the access in one guest call, with no boundary between:
+	 * the entry parked the host's base, so the fault below carries a valid
+	 * parked value to check against - exactly a quantum drop mid-guest. */
+	".globl ClobberAndProbe\n.type ClobberAndProbe,@function\n"
+	"ClobberAndProbe:\n"
+	"\txor %eax, %eax\n"
+	"\twrfsbase %rax\n"
+	"\tmov %fs:0, %rax\n"
+	"\tret\n"
 	/* straight into the host's syscall entry, as SyscallR10 does: libc's
 	 * syscall() is not the thing under test here */
 	".globl UnknownSyscall\n.type UnknownSyscall,@function\n"

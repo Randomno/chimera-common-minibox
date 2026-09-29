@@ -331,6 +331,9 @@ void mb_tripguard_set_layout(const mb_layout *l);
  * memory inside the mb_host, so a host that is freed leaves the fault handler
  * reading a dead heap chunk the next time anything at all faults. */
 void mb_tripguard_forget_layout(const mb_layout *l);
+/* Whether a raw read of one word at addr can fault: for stack walks in
+ * diagnostics, which must never take the reporter down with the guest. */
+bool mb_page_readable(uintptr_t addr);
 /* What the handler would name regions with right now (NULL when no machine is
  * up). Here so a test can ask; nothing in the host reads it. */
 const mb_layout *mb_tripguard_layout(void);

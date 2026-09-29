@@ -172,9 +172,12 @@ uintptr_t mb_call_guest_simple(uintptr_t entry, mb_context *c) {
 	/* Guest code may use %fs-direct TLS (Rust does); give it its own thread
 	 * pointer and put the host's %fs back afterwards. On the very first entry
 	 * (_start) thread_area is still 0 - musl sets it during that call - so
-	 * leave %fs alone until it exists; the guest uses %gs until then. */
+	 * leave %fs alone until it exists; the guest uses %gs until then.
+	 * The host's base is parked (and put back) for every guest: a repair may
+	 * have installed the guest's thread pointer meanwhile, even for a guest
+	 * that never swapped. */
+	c->host_fs = mb_rdfsbase();
 	if (c->fs_swap) {
-		c->host_fs = mb_rdfsbase();
 		mb_guest_ctx = c;
 		if (c->thread_area) mb_wrfsbase(c->thread_area);
 		uintptr_t r = f(entry, c);
@@ -182,7 +185,11 @@ uintptr_t mb_call_guest_simple(uintptr_t entry, mb_context *c) {
 		return r;
 	}
 #endif
-	return f(entry, c);
+	uintptr_t r = f(entry, c);
+#ifdef MB_HAVE_FSBASE
+	mb_wrfsbase(c->host_fs);
+#endif
+	return r;
 }
 
 uintptr_t mb_get_callback_ptr(uintptr_t slot) {
@@ -291,7 +298,13 @@ uintptr_t mb_thunks_get(mb_thunks *t, uintptr_t guest_entry, mb_context *c) {
  * on the way in), call, and restore the guest's on the way out. It has to be
  * instructions rather than C for the same reason the syscall dispatcher does:
  * anything that runs before the swap runs on the wrong TLS.
- */
+ *
+ * Swapping guests only: for the rest the ambient base is whatever guest and
+ * host share, and changing it around every callback would flap what %fs
+ * reads return. (A repair may still have installed the thread pointer
+ * meanwhile; a host callback that touches thread locals in that window reads
+ * the guest's block instead of its own - unobserved to date, and the window
+ * closes at the next boundary.) */
 uintptr_t mb_thunks_get_extcall(mb_thunks *t, uintptr_t cb, mb_context *c) {
 #ifdef MB_HAVE_FSBASE
 	if (!c->fs_swap) return cb;

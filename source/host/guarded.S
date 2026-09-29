@@ -132,12 +132,12 @@ mb_guarded_call:
 	movq %rsp, CTX_ESC_RSP(%r10)
 	incq CTX_CALLS(%r10)
 
-	/* the host's %fs, where the syscall dispatcher and the way out both read it */
-	cmpb $0, CTX_FS_SWAP(%r10)
-	je 1f
+	/* the host's %fs, where the syscall dispatcher and the way out both read
+	 * it - parked for every guest, not only swapping ones: a repair may have
+	 * installed the guest's thread pointer meanwhile, and the way out must
+	 * put the host's back regardless. */
 	rdfsbase %rax
 	movq %rax, CTX_HOST_FS(%r10)
-1:
 	/* a dead machine runs nothing */
 	cmpb $0, CTX_DEAD(%r10)
 	jne .Lrefused
@@ -159,13 +159,12 @@ mb_guarded_call:
 	movq FRAME_CTX(%rsp), %r10
 	movq FRAME_PREV_ESC(%rsp), %r11
 	movq %r11, CTX_ESC_RSP(%r10)
-	cmpb $0, CTX_FS_SWAP(%r10)
-	je 3f
+	/* the host's %fs back, unconditionally: what entry parked is the truth,
+	 * whether the guest ever swapped or a repair installed its pointer. */
 	movq %rax, %r11
 	movq CTX_HOST_FS(%r10), %rax
 	wrfsbase %rax
 	movq %r11, %rax
-3:
 	movdqu FRAME_XMM+0(%rsp), %xmm6
 	movdqu FRAME_XMM+16(%rsp), %xmm7
 	movdqu FRAME_XMM+32(%rsp), %xmm8
